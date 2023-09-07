@@ -1,19 +1,22 @@
 #!/usr/bin/env python
 
+import re
 import argparse
 import logging
 
+import tempfile
+import subprocess
+
 import numpy as np
-import matplotlib.pyplot as plt
-import plotly.express as pe
 import plotly.graph_objects as go
+
 from collections import defaultdict
+from typing import List
 
-from svgdigitizer.svg import SVG, LabeledPaths, LabeledPath
-from svgdigitizer.svgplot import SVGPlot
-from svgdigitizer.svgfigure import SVGFigure
+from svgpathtools.parser import parse_transform as spt_parse_transform
+from svgpathtools.parser import parse_path as spt_parse_path
+from svgpathtools.path import transform as spt_transform
 
-import re
 from xml.dom import Node, minidom
 
 
@@ -24,8 +27,6 @@ LOGGER = logging.getLogger(__file__)
 
 def list_of_num(arg):
     arg = arg.split(",")
-    # if len(arg) != 2:
-    #     raise ValueError("It must be in the format of a,b (e.g. 30.0,2.2)")
     return tuple(map(float, arg))
 
 
@@ -46,7 +47,7 @@ parser.add_argument(
 )
 
 
-def get_plotly_go(fig=None, reverse=True):
+def get_plotly_go(fig=None, reverse: bool = True):
     if fig is None:
         fig = go.Figure()
         if reverse:
@@ -54,7 +55,7 @@ def get_plotly_go(fig=None, reverse=True):
     return fig
 
 
-def rgb_string_add_alpha(rgb_str, alpha):
+def rgb_string_add_alpha(rgb_str: str, alpha: float):
     """
     TEST:
 
@@ -67,6 +68,104 @@ def rgb_string_add_alpha(rgb_str, alpha):
     rgb_vals = np.array([float(val.strip()[:-1]) for val in inner.split(",")])
     rgb_vals = (rgb_vals / 100) * 255
     return f"rgba({rgb_vals[0]},{rgb_vals[1]},{rgb_vals[2]},{alpha})"
+
+
+def path_points(path):
+    r"""
+    Return the points defining this path.
+
+    This returns the raw points in the `d` attribute, ignoring the
+    commands that connect these points, i.e., ignoring whether these
+    points are connected by `M` commands that do not actually draw
+    anything, or any kind of visible curve.
+    """
+    return [(path[0].start.real, path[0].start.imag)] + [
+        (command.end.real, command.end.imag) for command in path
+    ]
+
+
+def _get_transform(element):
+    r"""
+    Return the transformation needed to bring `element` into the root
+    context of the SVG document.
+
+    EXAMPLES::
+
+        >>> from io import StringIO
+        >>> svg = SVG(StringIO(r'''
+        ... <svg>
+        ...   <g transform="translate(10, 10)">
+        ...     <text x="0" y="0">curve: 0</text>
+        ...   </g>
+        ... </svg>'''))
+        >>> SVG._get_transform(svg.svg.getElementsByTagName("text")[0])
+        array([[ 1.,  0., 10.],
+                [ 0.,  1., 10.],
+                [ 0.,  0.,  1.]])
+
+    """
+
+    if element is None or element.nodeType == Node.DOCUMENT_NODE:
+        return spt_parse_transform(None)
+
+    return _get_transform(element.parentNode).dot(
+        spt_parse_transform(element.getAttribute("transform"))
+    )
+
+
+def _svg_transform(element):
+    r"""
+    Return a transformed version of `element` with all `transform` attributes applied.
+
+    EXAMPLES:
+
+    Transformations can be applied to text elements::
+
+        >>> from io import StringIO
+        >>> svg = SVG(StringIO(r'''
+        ... <svg>
+        ...   <g transform="translate(100, 10)">
+        ...     <text x="0" y="0" transform="translate(100, 10)">curve: 0</text>
+        ...   </g>
+        ... </svg>'''))
+        >>> transformed = svg.transform(svg.svg.getElementsByTagName("text")[0])
+        >>> transformed.toxml()
+        '<text x="200.0" y="20.0">curve: 0</text>'
+
+    Transformations can be applied to paths::
+
+        >>> svg = SVG(StringIO(r'''
+        ... <svg>
+        ...   <g transform="translate(100, 10)">
+        ...     <path d="M 0 0 L 1 1" transform="translate(100, 10)" />
+        ...   </g>
+        ... </svg>'''))
+        >>> svg.transform(svg.svg.getElementsByTagName("path")[0])
+        Path(Line(start=(200+20j), end=(201+21j)))
+
+    """
+    transformation = _get_transform(element)
+
+    if element.getAttribute("d"):
+        # element is like a path
+        element = spt_transform(
+            spt_parse_path(element.getAttribute("d")), transformation
+        )
+    elif element.hasAttribute("x") and element.hasAttribute("y"):
+        # elements with an explicit location such as <text>
+        x = float(element.getAttribute("x"))
+        y = float(element.getAttribute("y"))
+        x, y, _ = transformation.dot([x, y, 1])
+
+        element = element.cloneNode(deep=True)
+        if element.hasAttribute("transform"):
+            element.removeAttribute("transform")
+        element.setAttribute("x", str(x))
+        element.setAttribute("y", str(y))
+    else:
+        raise NotImplementedError(f"Unsupported element {element}.")
+
+    return element
 
 
 class PotentialTick:
@@ -97,7 +196,12 @@ class PotentialTick:
         return f"<PT@[{self.line[0][0]:.1f},{self.line[0][1]:.1f}] | {self.direction} L={self.length}>"
 
 
-def get_transform_func(coor_min, coor_max, val_at_min, val_at_max):
+def get_transform_func(
+    coor_min: float, coor_max: float, val_at_min: float, val_at_max: float
+) -> float:
+    """
+    Given a svg canvas coordinate and actual ticks value, returns a transformation function
+    """
     _coor_range = coor_max - coor_min
     assert abs(_coor_range) > 0
     _val_range = val_at_max - val_at_min
@@ -219,11 +323,11 @@ class SvgPath:
 
     @property
     def points(self):
-        return np.asarray(LabeledPath.path_points(self.path))
+        return np.asarray(path_points(self.path))
 
     @property
     def path(self):
-        return SVG.transform(self._path)
+        return _svg_transform(self._path)
 
     def plot(self, fig=None, **kwargs):
         fig = get_plotly_go(fig)
@@ -232,7 +336,9 @@ class SvgPath:
         return fig
 
     def __repr__(self):
-        return f'Path "{self.label if self.label is not None else self._path.toxml()}"'
+        return (
+            f'<Path "{self.label if self.label is not None else self._path.toxml()}">'
+        )
 
 
 class SvgPaths:
@@ -276,9 +382,9 @@ def get_all_vector_paths(svg_element):
             if child.nodeType == Node.COMMENT_NODE:
                 continue
 
-            if child.nodeType == Node.TEXT_NODE:
-                if SVG._text_value(child):
-                    pass
+            # if child.nodeType == Node.TEXT_NODE:
+            #     if SVG._text_value(child):
+            #         pass
             #                         print(
             #                             f'Ignoring unexpected text node "{SVG._text_value(child)}" grouped with <path>.'
             #                         )
@@ -359,10 +465,13 @@ def format_fig(fig, width=500, height=300, tickwidth=2.4, linewidth=2.4):
 
 
 def main(args):
-    with open(args.svgfile, "rb") as f:
-        svg_file = p = SVG(f)
+    ## from string
+    # svg_file = minidom.parseString(svg)
 
-    all_vector_paths = get_all_vector_paths(svg_file.svg)
+    with open(args.svgfile, "rb") as f:
+        svg_file = minidom.parse(f)
+
+    all_vector_paths = get_all_vector_paths(svg_file)
 
     if args.show_all_lines:
         fig = None
@@ -371,39 +480,42 @@ def main(args):
         fig.show()
 
     # ticks normall has more than 1 child
-    vector_paths_of_tick = [vp for vp in all_vector_paths if len(vp) > 1][0]
-    canvas_ticks = CanvasTicks.from_list_of_lines(vector_paths_of_tick.points)
+    vector_paths_of_tick = [vp for vp in all_vector_paths if len(vp) > 1]
+    if len(vector_paths_of_tick) > 0:
+        if len(vector_paths_of_tick) > 1:
+            LOGGER.warning(
+                f"vector_paths_of_tick is ambigious as more than 1 was found: {len(vector_paths_of_tick)}"
+            )
+        canvas_ticks = CanvasTicks.from_list_of_lines(vector_paths_of_tick[0].points)
+    else:
+        # cannot infer ticks.
+        canvas_ticks = None
 
     transformation_function = None
 
-    if args.xticks and args.yticks is not None:
+    if args.xticks and args.yticks and canvas_ticks is not None:
         transformation_function = canvas_ticks.assign_axis_ticks_values(
             args.xticks,
             args.yticks,
         )
 
     if args.show_ticks:
-        # transformation_function = canvas_ticks.assign_axis_ticks_values(
-        #     [0, 1, 2, 3, 4, 5], np.asarray([0, 0.25, 0.5, 0.75, 1]) * 1e3
-        # )
-        fig = None
-        fig = canvas_ticks.plot(fig=fig)
+        if canvas_ticks is None:
+            LOGGER.error("Cannot find ticks")
+            exit(1)
+        fig = canvas_ticks.plot()
         # fig = canvas_ticks.plot(fig=fig, transform=transformation_function)
         fig.show()
 
     grouped_path = group_potential_plots(all_vector_paths)
 
     if args.show_grouped_plots:
-        fig = None
-        if fig is None:
-            fig = get_plotly_go(reverse=transformation_function is None)
+        fig = get_plotly_go(reverse=transformation_function is None)
 
         for color, paths in grouped_path["stroke"].items():
             print(color)
 
-            for p in paths:
-                xy = np.array(p.points)
-
+            for xy in (p.points for p in paths):
                 if transformation_function is not None:
                     xy = transformation_function(xy)
 
@@ -434,9 +546,22 @@ def main(args):
         fig.show()
 
 
-def run():
-    _args = parser.parse_args()
+def run(args):
+    if not any(args.svgfile.endswith(ext) for ext in (".pdf", ".svg")):
+        LOGGER.error(f"Invalid extension for input file {args.svgfile}")
+        exit(1)
+
+    if args.svgfile.endswith(".pdf"):
+        with tempfile.NamedTemporaryFile() as temp_file:
+            try:
+                subprocess.check_call(["pdf2svg", args.svgfile, temp_file.name])
+                args.svgfile = temp_file.name
+            except subprocess.CalledProcessError as e:
+                print(e.returncode)
+                exit(e.returncode)
+            # process the output as svg
+            main(args)
 
 
 if __name__ == "__main__":
-    main(parser.parse_args())
+    run(parser.parse_args())
