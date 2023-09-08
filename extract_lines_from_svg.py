@@ -3,6 +3,7 @@
 import re
 import argparse
 import logging
+import json
 
 import tempfile
 import subprocess
@@ -11,7 +12,7 @@ import numpy as np
 import plotly.graph_objects as go
 
 from collections import defaultdict
-from typing import List
+from typing import List, Tuple, Optional
 
 from svgpathtools.parser import parse_transform as spt_parse_transform
 from svgpathtools.parser import parse_path as spt_parse_path
@@ -45,6 +46,7 @@ parser.add_argument(
     "-y",
     type=list_of_num,
 )
+parser.add_argument("--save-as-json", "-s", action="store_true")
 
 
 def get_plotly_go(fig=None, reverse: bool = True):
@@ -52,10 +54,16 @@ def get_plotly_go(fig=None, reverse: bool = True):
         fig = go.Figure()
         if reverse:
             fig.update_yaxes(autorange="reversed")
+        # fig.update_yaxes(tickformat="e")
     return fig
 
 
-def rgb_string_add_alpha(rgb_str: str, alpha: float):
+def rgb_string_extract_val(rgb_str: str) -> np.ndarray:
+    inner = re.search(r"[(]([^)]*)", rgb_str)[1]
+    return np.array([float(val.strip()[:-1]) for val in inner.split(",")])
+
+
+def rgb_string_add_alpha(rgb_str: str, alpha: float) -> str:
     """
     TEST:
 
@@ -64,8 +72,7 @@ def rgb_string_add_alpha(rgb_str: str, alpha: float):
         rgb_string_add_alpha(rgb_str, 0.5)
     """
 
-    inner = re.search(r"[(]([^)]*)", rgb_str)[1]
-    rgb_vals = np.array([float(val.strip()[:-1]) for val in inner.split(",")])
+    rgb_vals = rgb_string_extract_val(rgb_str=rgb_str)
     rgb_vals = (rgb_vals / 100) * 255
     return f"rgba({rgb_vals[0]},{rgb_vals[1]},{rgb_vals[2]},{alpha})"
 
@@ -168,6 +175,39 @@ def _svg_transform(element):
     return element
 
 
+import uuid
+
+
+class NpNdarrayEncoder(json.JSONEncoder):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.kwargs = dict(kwargs)
+        del self.kwargs["indent"]
+        self._replacement_map = {}
+
+    def default(self, o):
+        if isinstance(o, np.ndarray):
+            key = uuid.uuid4().hex
+            self._replacement_map[key] = json.dumps(
+                o.tolist(), **self.kwargs, cls=self.__class__
+            )
+            return "@@%s@@" % (key,)
+        elif isinstance(o, SvgPath):
+            key = uuid.uuid4().hex
+            self._replacement_map[key] = json.dumps(
+                o.to_json(), **self.kwargs, cls=self.__class__
+            )
+            return "@@%s@@" % (key,)
+        else:
+            return super().default(o)
+
+    def encode(self, o):
+        result = super().encode(o)
+        for k, v in self._replacement_map.items():
+            result = result.replace('"@@%s@@"' % (k,), v)
+        return result
+
+
 class PotentialTick:
     def __init__(self, line):
         self.line = line
@@ -208,9 +248,13 @@ def get_transform_func(
     assert _val_range > 0
 
     def _transform(coor):
-        return ((coor - coor_min) / _coor_range) * _val_range
+        return val_at_min + ((coor - coor_min) / _coor_range) * _val_range
 
     return _transform
+
+
+class CanvasTicksNoCanidateError(Exception):
+    pass
 
 
 class CanvasTicks:
@@ -240,6 +284,8 @@ class CanvasTicks:
         list_of_lines = filter(lambda x: len(x) == 2, list_of_lines)
         # filter out lines that are straight (vertical or horziontal)
         potential_ticks = [PotentialTick(line) for line in list_of_lines]
+        if len(potential_ticks) < 1:
+            raise CanvasTicksNoCanidateError()
 
         # ticks should be short
         _min_len = min(t.length for t in potential_ticks)
@@ -306,6 +352,11 @@ class SvgPath:
     def __init__(self, path, label=None):
         self._path = path
         self.label = label
+        self.transformation_function = None
+
+    def set_transformation_function(self, transformation_function):
+        self.set_transformation_function = transformation_function
+        return self
 
     @property
     def far(self):
@@ -329,16 +380,70 @@ class SvgPath:
     def path(self):
         return _svg_transform(self._path)
 
+    @classmethod
+    def _ensure_output(cls, _str) -> Optional[str]:
+        if _str is None or _str.lower() == "none":
+            return None
+        return _str
+
+    @property
+    def color(self) -> Optional[str]:
+        if self._path.hasAttribute("stroke"):
+            return self._ensure_output(self._path.getAttribute("stroke"))
+        return None
+
+    @property
+    def fill_color(self) -> Optional[str]:
+        out = None
+        # is DEFINITELY fill
+        if self._path.hasAttribute("fill"):
+            out = self._path.getAttribute("fill")
+
+        # is (probably) fill? if the path forms a loop
+        elif np.linalg.norm(self.points[0, :] - self.points[0, 1]) < EPS:
+            # // use stroke color as fill color
+            out = self.color
+
+        return self._ensure_output(out)
+
     def plot(self, fig=None, **kwargs):
+        _kwargs = dict(kwargs)
         fig = get_plotly_go(fig)
         xy = self.points
-        fig.add_scatter(x=xy[:, 0], y=xy[:, 1], **kwargs)
+        if self.fill_color is not None:
+            _kwargs["fill"] = "toself"
+            _kwargs["mode"] = "none"
+            _kwargs["fillcolor"] = rgb_string_add_alpha(self.fill_color, 0.3)
+        elif self.color is not None:
+            _kwargs["line_color"] = self.color
+            _kwargs["mode"] = "lines"
+        else:
+            _kwargs["line_color"] = rgb_string_add_alpha("rgb(0%,0%,0%)", 0.25)
+
+        fig.add_scatter(x=xy[:, 0], y=xy[:, 1], **_kwargs)
         return fig
 
     def __repr__(self):
         return (
             f'<Path "{self.label if self.label is not None else self._path.toxml()}">'
         )
+
+    def to_json(self):
+        json_dict = {}
+        json_dict["type"] = "line"
+        if self.fill_color is not None:
+            json_dict["type"] = "shaded"
+            json_dict["color"] = self.fill_color
+        elif self.color is not None:
+            json_dict["color"] = self.color
+
+        xy = self.points
+        if self.transformation_function is not None:
+            xy = self.transformation_function(xy)
+
+        json_dict["x"] = xy[:, 0]
+        json_dict["y"] = xy[:, 1]
+        return json_dict
 
 
 class SvgPaths:
@@ -417,15 +522,37 @@ def get_all_vector_paths(svg_element):
     return _paths
 
 
-def group_potential_plots(all_vector_paths):
-    grouped_path = dict(stroke=defaultdict(list))
+def filter_potential_plots(
+    all_vector_paths,
+    filter_out_multi_paths: bool = False,
+    filter_out_black_path: bool = True,
+    filter_out_white_fill: bool = True,
+):
+    grouped_path = defaultdict(list)
     for paths in all_vector_paths:
-        if len(paths) > 1:
-            # these are ticks
+        if filter_out_multi_paths and len(paths) > 1:
+            # these are (likely) ticks
             continue
         for p in paths:
-            if p._path.hasAttribute("stroke"):
-                grouped_path["stroke"][p._path.getAttribute("stroke")].append(p)
+            _stroke_color = p.color
+            if _stroke_color:
+                if (
+                    filter_out_black_path
+                    and not np.isclose(
+                        rgb_string_extract_val(_stroke_color), np.zeros(3)
+                    ).all()
+                ):
+                    grouped_path[_stroke_color].append(p)
+            else:
+                _fill_color = p.fill_color
+                if _fill_color:
+                    if (
+                        filter_out_white_fill
+                        and not np.isclose(
+                            rgb_string_extract_val(_fill_color), np.ones(3) * 100
+                        ).all()
+                    ):
+                        grouped_path[_fill_color].append(p)
     return grouped_path
 
 
@@ -482,11 +609,22 @@ def main(args):
     # ticks normall has more than 1 child
     vector_paths_of_tick = [vp for vp in all_vector_paths if len(vp) > 1]
     if len(vector_paths_of_tick) > 0:
-        if len(vector_paths_of_tick) > 1:
+        valid_canvas_ticks = []
+        for vector_path_of_tick in vector_paths_of_tick:
+            try:
+                valid_canvas_ticks.append(
+                    CanvasTicks.from_list_of_lines(vector_path_of_tick.points)
+                )
+                break
+            except CanvasTicksNoCanidateError:
+                # try next canidate
+                pass
+        if len(valid_canvas_ticks) > 1:
             LOGGER.warning(
-                f"vector_paths_of_tick is ambigious as more than 1 was found: {len(vector_paths_of_tick)}"
+                f"vector_paths_of_tick is ambigious as more than 1 was found: {len(valid_canvas_ticks)}"
             )
-        canvas_ticks = CanvasTicks.from_list_of_lines(vector_paths_of_tick[0].points)
+        canvas_ticks = valid_canvas_ticks[0]
+
     else:
         # cannot infer ticks.
         canvas_ticks = None
@@ -507,37 +645,26 @@ def main(args):
         # fig = canvas_ticks.plot(fig=fig, transform=transformation_function)
         fig.show()
 
-    grouped_path = group_potential_plots(all_vector_paths)
+    grouped_path = filter_potential_plots(all_vector_paths)
+
+    line_plots = []
+    for color, paths in grouped_path.items():
+        line_plot = dict(
+            paths=[
+                p.set_transformation_function(transformation_function) for p in paths
+            ],
+            color=color,
+        )
+
+        line_plots.append(line_plot)
 
     if args.show_grouped_plots:
         fig = get_plotly_go(reverse=transformation_function is None)
 
-        for color, paths in grouped_path["stroke"].items():
-            print(color)
-
-            for xy in (p.points for p in paths):
-                if transformation_function is not None:
-                    xy = transformation_function(xy)
-
-                _first_pt = xy[0, :]
-                _last_pt = xy[-1, :]
-
-                kwargs = dict(
-                    x=xy[:, 0],
-                    y=xy[:, 1],
-                    line_color=color,
-                    mode="lines",
-                )
-                if np.linalg.norm(_first_pt - _last_pt) < 1e-1:
-                    # shaded region
-                    kwargs["fill"] = "toself"
-                    kwargs["fillcolor"] = rgb_string_add_alpha(color, 0.3)
-                    kwargs["mode"] = "none"
-                    kwargs["showlegend"] = False
-                else:
-                    pass
-
-                fig.add_scatter(**kwargs)
+        for line_plot in line_plots:
+            color = line_plot["color"]
+            for path in line_plot["paths"]:
+                path.plot(fig)
 
         fig.update_layout(template="simple_white")
         # fig.update_layout(xaxis_range=[0, 5], yaxis_range=[0, 1e3 + 100])
@@ -545,8 +672,14 @@ def main(args):
         # format_fig(fig, width=500, height=250, tickwidth=1.2, linewidth=1.2)
         fig.show()
 
+    if args.save_as_json:
+        # Serializing json
+        with open(f"{args.ori_name}.json", "w") as outfile:
+            outfile.write(json.dumps(line_plots, indent=4, cls=NpNdarrayEncoder))
+
 
 def run(args):
+    args.ori_name = args.svgfile
     if not any(args.svgfile.endswith(ext) for ext in (".pdf", ".svg")):
         LOGGER.error(f"Invalid extension for input file {args.svgfile}")
         exit(1)
