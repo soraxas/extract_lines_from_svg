@@ -307,8 +307,14 @@ class CanvasTicks:
         return horziontal_ticks, vertical_ticks
 
     def assign_axis_ticks_values(self, x_tick_values, y_tick_values):
-        assert len(x_tick_values) == len(self.horziontal_ticks)
-        assert len(y_tick_values) == len(self.vertical_ticks)
+        if len(x_tick_values) != len(self.horziontal_ticks):
+            raise ValueError(
+                f"Given xticks: {len(x_tick_values)}, but only able to infer {len(self.horziontal_ticks)} ticks"
+            )
+        if len(y_tick_values) != len(self.vertical_ticks):
+            raise ValueError(
+                f"Given yticks: {len(y_tick_values)}, but only able to infer {len(self.vertical_ticks)} ticks"
+            )
         self.x_tick_values = x_tick_values
         self.y_tick_values = y_tick_values
 
@@ -352,10 +358,11 @@ class SvgPath:
     def __init__(self, path, label=None):
         self._path = path
         self.label = label
-        self.transformation_function = None
+        self.transform_func = lambda x: x
 
     def set_transformation_function(self, transformation_function):
-        self.set_transformation_function = transformation_function
+        if transformation_function is not None:
+            self.transform_func = transformation_function
         return self
 
     @property
@@ -373,8 +380,12 @@ class SvgPath:
         ]
 
     @property
-    def points(self):
+    def _points(self):
         return np.asarray(path_points(self.path))
+
+    @property
+    def points(self):
+        return self.transform_func(self._points)
 
     @property
     def path(self):
@@ -393,17 +404,32 @@ class SvgPath:
         return None
 
     @property
-    def fill_color(self) -> Optional[str]:
-        out = None
+    def _real_fill_color(self) -> Optional[str]:
         # is DEFINITELY fill
         if self._path.hasAttribute("fill"):
-            out = self._path.getAttribute("fill")
+            return self._ensure_output(self._path.getAttribute("fill"))
+        return None
 
+    @property
+    def _maybe_fill_color(self) -> Optional[str]:
+        print(np.linalg.norm(self._points[0, :] - self._points[0, 1]))
         # is (probably) fill? if the path forms a loop
-        elif np.linalg.norm(self.points[0, :] - self.points[0, 1]) < EPS:
+        if np.linalg.norm(self._points[0, :] - self._points[0, 1]) < EPS:
             # // use stroke color as fill color
-            out = self.color
+            return self._ensure_output(self.color)
+        # is (probably) fill? if the fill property is given but is none
+        # if self._path.hasAttribute("fill") and not self._ensure_output(self._path.getAttribute("fill")):
+        #     return self.color
+        #     # // use stroke color as fill color
+        #     return self._ensure_output(self.color)
+        return None
 
+    @property
+    def fill_color(self) -> Optional[str]:
+        out = self._real_fill_color
+        if out is None:
+            out = self._maybe_fill_color
+            print(out)
         return self._ensure_output(out)
 
     def plot(self, fig=None, **kwargs):
@@ -438,9 +464,6 @@ class SvgPath:
             json_dict["color"] = self.color
 
         xy = self.points
-        if self.transformation_function is not None:
-            xy = self.transformation_function(xy)
-
         json_dict["x"] = xy[:, 0]
         json_dict["y"] = xy[:, 1]
         return json_dict
@@ -527,6 +550,7 @@ def filter_potential_plots(
     filter_out_multi_paths: bool = False,
     filter_out_black_path: bool = True,
     filter_out_white_fill: bool = True,
+    transformation_function=None,
 ):
     grouped_path = defaultdict(list)
     for paths in all_vector_paths:
@@ -534,6 +558,7 @@ def filter_potential_plots(
             # these are (likely) ticks
             continue
         for p in paths:
+            p.set_transformation_function(transformation_function)
             _stroke_color = p.color
             if _stroke_color:
                 if (
@@ -631,11 +656,16 @@ def main(args):
 
     transformation_function = None
 
-    if args.xticks and args.yticks and canvas_ticks is not None:
-        transformation_function = canvas_ticks.assign_axis_ticks_values(
-            args.xticks,
-            args.yticks,
-        )
+    if args.xticks:
+        if canvas_ticks is None:
+            LOGGER.warning(
+                f"x and y ticks are given, but couldn't infer canvas ticks... Ignoring for now."
+            )
+        else:
+            transformation_function = canvas_ticks.assign_axis_ticks_values(
+                args.xticks,
+                args.yticks,
+            )
 
     if args.show_ticks:
         if canvas_ticks is None:
@@ -645,14 +675,16 @@ def main(args):
         # fig = canvas_ticks.plot(fig=fig, transform=transformation_function)
         fig.show()
 
-    grouped_path = filter_potential_plots(all_vector_paths)
+    grouped_path = filter_potential_plots(
+        all_vector_paths, transformation_function=transformation_function
+    )
+    # print()
+    # grouped_path = {color: [p.set_transformation_function(transformation_function) for p in paths] for color, paths in grouped_path.items()}
 
     line_plots = []
     for color, paths in grouped_path.items():
         line_plot = dict(
-            paths=[
-                p.set_transformation_function(transformation_function) for p in paths
-            ],
+            paths=paths,
             color=color,
         )
 
@@ -683,6 +715,11 @@ def run(args):
     if not any(args.svgfile.endswith(ext) for ext in (".pdf", ".svg")):
         LOGGER.error(f"Invalid extension for input file {args.svgfile}")
         exit(1)
+
+    if args.xticks or args.yticks:
+        if not (args.xticks and args.yticks):
+            LOGGER.error(f"x or y ticks are given, but one of them is missing!")
+            exit(1)
 
     if args.svgfile.endswith(".pdf"):
         with tempfile.NamedTemporaryFile() as temp_file:
